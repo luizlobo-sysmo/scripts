@@ -1,0 +1,450 @@
+"""Abre o tunel SSH ate o banco de um cliente, lendo os dados da base compartilhada.
+
+Reusavel por qualquer projeto: recebe o cliente (id ou nome), abre o encaminhamento
+e imprime em stdout uma linha JSON com a porta local. Quem chamou conecta em
+127.0.0.1:<porta>.
+
+    python tunel.py --abrir cegil
+    {"cliente": "Cegil", "porta": 53197, "pid": 12345, "destino": "192.168.2.5:5432"}
+
+    python tunel.py --fechar 12345
+    python tunel.py --listar
+
+Porta local efemera por padrao (o sistema escolhe uma livre). Porta fixa dava
+colisao entre clientes e com outros processos, e obrigava um cliente por vez.
+
+A senha SSH nunca vai para stdout nem para a linha de comando: no Windows e
+escrita num .bat temporario; no Linux vai por SSH_ASKPASS a partir de /dev/shm.
+Isso evita que apareca em `ps` ou no historico do shell.
+
+Host key: exigida e conferida contra o pino gravado no cadastro (ssh_hostkey).
+Sem pino, a primeira conexao grava a chave apresentada e avisa - trocas
+posteriores passam a ser recusadas.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cliente_ssh  # noqa: E402
+
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def achar_plink() -> str:
+    """Localiza o plink.exe. Nada fixo: variavel de ambiente, PATH, e por ultimo
+    os diretorios usuais de instalacao - em qualquer unidade, nao so C:."""
+    do_ambiente = os.environ.get("PLINK")
+    if do_ambiente and Path(traduzir(do_ambiente)).exists():
+        return janela(Path(traduzir(do_ambiente)))
+
+    from shutil import which
+    achado = which("plink.exe") or which("plink")
+    if achado:
+        # O plink e chamado pelo cmd.exe: o caminho tem que estar em formato
+        # Windows, mesmo quando o which do WSL devolve /mnt/c/...
+        return janela(Path(achado))
+
+    unidades = ["c", "d", "e"] if IS_LINUX else [None]
+    for unidade in unidades:
+        raizes = ([Path(f"/mnt/{unidade}/Program Files"),
+                   Path(f"/mnt/{unidade}/Program Files (x86)")] if IS_LINUX
+                  else [Path(r"C:\Program Files"), Path(r"C:\Program Files (x86)")])
+        for raiz in raizes:
+            if not raiz.exists():
+                continue
+            for candidato in raiz.glob("PuTTY*/plink.exe"):
+                return janela(candidato)
+    raise RuntimeError(
+        "plink.exe nao encontrado. Instale o PuTTY, coloque no PATH, ou aponte a "
+        "variavel PLINK para o executavel.")
+
+
+def traduzir(caminho_windows: str) -> str:
+    r"""C:\x -> /mnt/c/x quando rodando no WSL, para poder testar existencia."""
+    if not IS_LINUX or len(caminho_windows) < 2 or caminho_windows[1] != ":":
+        return caminho_windows
+    unidade = caminho_windows[0].lower()
+    return f"/mnt/{unidade}/" + caminho_windows[2:].lstrip("\\/").replace("\\", "/")
+
+
+def janela(caminho: Path) -> str:
+    r"""/mnt/c/x -> C:\x, formato que o cmd.exe entende."""
+    partes = caminho.parts
+    if len(partes) > 2 and partes[1] == "mnt":
+        return f"{partes[2].upper()}:\\" + "\\".join(partes[3:])
+    return str(caminho)
+
+# Rodando no WSL, o tunel precisa ser aberto por um binario WINDOWS quando quem
+# consome tambem e Windows (backend Java): o WSL2 em NAT tem loopback proprio, e
+# um tunel aberto pelo ssh do WSL nao e alcancado pelo lado Windows.
+USAR_WINDOWS = not IS_LINUX or Path("/mnt/c/Windows/System32/cmd.exe").exists()
+
+
+def porta_livre() -> int:
+    """Pede ao sistema uma porta livre. Ha uma janela entre fechar e o plink
+    abrir; e curta e o proprio plink falha alto se perder a corrida."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def escutando(porta: int) -> bool:
+    """Alguem escuta na porta.
+
+    Rodando no WSL com tunel do lado Windows, o teste TEM que ser feito pelo
+    Windows: o WSL2 em NAT tem loopback proprio e nunca veria o listener do
+    plink, fazendo a espera falhar mesmo com o tunel de pe.
+    """
+    if IS_LINUX and USAR_WINDOWS:
+        r = subprocess.run(
+            ["cmd.exe", "/c", f"netstat -ano | findstr LISTENING | findstr :{porta}"],
+            capture_output=True, text=True, errors="replace", cwd="/mnt/c")
+        return any(f":{porta}" in l.split()[1] for l in r.stdout.splitlines()
+                   if len(l.split()) > 1)
+    with socket.socket() as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", porta)) == 0
+
+
+def pid_do_listener(porta: int) -> int:
+    """Pid WINDOWS de quem escuta na porta.
+
+    O Popen devolve o pid do cmd.exe - e, rodando no WSL, um pid do WSL, que o
+    taskkill nem reconhece. Quem precisa morrer e o plink, e so o Windows sabe o
+    pid dele.
+    """
+    cmd = ["cmd.exe", "/c", f"netstat -ano | findstr LISTENING | findstr :{porta}"]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                       cwd="/mnt/c" if IS_LINUX else None)
+    for linha in r.stdout.splitlines():
+        partes = linha.split()
+        if len(partes) >= 5 and partes[1].endswith(f":{porta}"):
+            return int(partes[-1])
+    return 0
+
+
+def win_temp() -> tuple[Path, str]:
+    if IS_LINUX:
+        usuario = os.environ.get("USER", "s277")
+        return Path(f"/mnt/c/Users/{usuario}/AppData/Local/Temp"), \
+            rf"C:\Users\{usuario}\AppData\Local\Temp"
+    temp = os.environ.get("TEMP", r"C:\Windows\Temp")
+    return Path(temp), temp
+
+
+def fingerprint_remota(cliente: dict, tipo: str) -> str:
+    """Fingerprint SHA256 da host key, via ssh-keyscan."""
+    cmd = ["ssh-keyscan", "-t", tipo, "-p", str(cliente["ssh_porta"] or 22),
+           cliente["ssh_endereco"]]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    linhas = [l for l in r.stdout.splitlines() if l and not l.startswith("#")]
+    if not linhas:
+        return ""
+    proc = subprocess.run(["ssh-keygen", "-lf", "-"], input="\n".join(linhas),
+                          capture_output=True, text=True, errors="replace")
+    m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", proc.stdout)
+    return m.group(1) if m else ""
+
+
+def extrair_fingerprint(pino: str | None) -> str:
+    """SHA256:... de dentro do pino gravado (que pode vir no formato completo do
+    ssh-keygen -lf: 'ssh-ed25519 255 SHA256:... comentario')."""
+    if not pino:
+        return ""
+    m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", pino)
+    return m.group(1) if m else pino.strip()
+
+
+def conferir_hostkey(cliente: dict) -> None:
+    """Recusa se a host key divergir do pino gravado no cadastro."""
+    pino = (cliente.get("ssh_hostkey") or "").strip()
+    if not pino:
+        atual = fingerprint_remota(cliente, "ed25519") or \
+            fingerprint_remota(cliente, "rsa")
+        if atual:
+            print(f"[aviso] host key nao fixada para {cliente['nome']}. "
+                  f"Apresentada agora: {atual}\n"
+                  f"        Confira por canal independente e grave em ssh_hostkey "
+                  f"para que trocas futuras sejam recusadas.", file=sys.stderr)
+        return
+
+    m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", pino)
+    esperado = m.group(1) if m else pino
+    tipo = "ed25519"
+    if "rsa" in pino.lower():
+        tipo = "rsa"
+    elif "ecdsa" in pino.lower():
+        tipo = "ecdsa"
+
+    atual = fingerprint_remota(cliente, tipo)
+    if not atual:
+        raise RuntimeError(
+            f"Nao obtive a host key {tipo} de {cliente['ssh_endereco']} "
+            "(ssh-keyscan sem resposta).")
+    if atual != esperado:
+        raise RuntimeError(
+            f"ALERTA: host key DIFERENTE da fixada no cadastro.\n"
+            f"  fixada  : {esperado}\n"
+            f"  servidor: {atual}\n"
+            "Conexao abortada. Pode ser troca legitima de servidor ou "
+            "interceptacao - confirme por canal independente antes de atualizar.")
+
+
+def abrir_windows(cliente: dict, porta: int) -> int:
+    """plink.exe em background. A senha fica num .bat temporario, nunca em `ps`."""
+    temp_wsl, temp_win = win_temp()
+    nome = f"tunel-{cliente['id']}-{porta}.bat"
+    bat_wsl = temp_wsl / nome
+    destino = f"{cliente['db_endereco']}:{cliente['db_porta'] or 5432}"
+
+    # -hostkey quando ha pino: com -batch o plink recusa chave desconhecida, e
+    # sem o parametro dependeriamos do cache do PuTTY - que nao existe em maquina
+    # nova nem quando outro usuario roda.
+    pino = extrair_fingerprint(cliente.get("ssh_hostkey"))
+    parametro_hostkey = f'-hostkey "{pino}" ' if pino else ""
+
+    # Senha entre aspas: senhas reais tem $ * ( & e o cmd.exe quebraria a linha
+    # sem elas. O .bat e apagado em seguida.
+    bat_wsl.write_text(
+        "@echo off\r\n"
+        f'"{achar_plink()}" -ssh -N -batch '
+        f'-P {cliente["ssh_porta"] or 22} '
+        f'-l {cliente["ssh_usuario"]} '
+        f'-pw "{cliente["ssh_senha"]}" '
+        f'{parametro_hostkey}'
+        f'-L 127.0.0.1:{porta}:{destino} '
+        f'{cliente["ssh_endereco"]}\r\n',
+        encoding="cp1252", newline="",
+    )
+
+    if IS_LINUX:
+        cmd = ["cmd.exe", "/c", rf"{temp_win}\{nome}"]
+        cwd = "/mnt/c"
+    else:
+        cmd = ["cmd.exe", "/c", str(bat_wsl)]
+        cwd = None
+
+    proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(40):
+            if escutando(porta):
+                # Pid do plink no Windows, nao do cmd.exe: e ele que sustenta o
+                # tunel e e ele que o --fechar precisa encerrar.
+                return pid_do_listener(porta) or proc.pid
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    "plink encerrou sem abrir o tunel. Confira usuario, senha e "
+                    "host key do cadastro.")
+            time.sleep(0.5)
+        raise RuntimeError(f"tunel nao subiu em 20s na porta {porta}.")
+    finally:
+        # O .bat contem a senha: apagar sempre, inclusive no caminho de erro. O
+        # plink ja esta rodando e nao precisa mais dele.
+        bat_wsl.unlink(missing_ok=True)
+
+
+def abrir_linux(cliente: dict, porta: int) -> int:
+    """ssh -L em background. Senha via SSH_ASKPASS a partir de /dev/shm."""
+    askpass = Path("/dev/shm/tunel-askpass.sh")
+    askpass.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' {shlex.quote(cliente['ssh_senha'])}\n", encoding="utf-8")
+    askpass.chmod(0o700)
+    destino = f"{cliente['db_endereco']}:{cliente['db_porta'] or 5432}"
+    try:
+        ambiente = {
+            **os.environ,
+            "SSH_ASKPASS": str(askpass),
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": os.environ.get("DISPLAY", ":0"),
+        }
+        proc = subprocess.Popen(
+            ["setsid", "ssh", "-N",
+             "-L", f"127.0.0.1:{porta}:{destino}",
+             "-p", str(cliente["ssh_porta"] or 22),
+             "-o", "StrictHostKeyChecking=accept-new",
+             "-o", f"UserKnownHostsFile={cliente_ssh.KNOWN_HOSTS}",
+             "-o", "NumberOfPasswordPrompts=1",
+             "-o", "ExitOnForwardFailure=yes",
+             "-o", "ServerAliveInterval=30",
+             f"{cliente['ssh_usuario']}@{cliente['ssh_endereco']}"],
+            env=ambiente, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            start_new_session=True)
+        for _ in range(40):
+            if escutando(porta):
+                return proc.pid
+            if proc.poll() is not None:
+                erro = (proc.stderr.read() or b"").decode(errors="replace")
+                raise RuntimeError(erro.strip() or "ssh encerrou sem abrir o tunel.")
+            time.sleep(0.5)
+        raise RuntimeError(f"tunel nao subiu em 20s na porta {porta}.")
+    finally:
+        askpass.unlink(missing_ok=True)
+
+
+REGISTRO = cliente_ssh.PASTA_BASE / "tuneis.json"
+
+
+def registro_ler() -> dict:
+    """Tuneis abertos, por id de cliente. Existe para varios processos
+    reaproveitarem o mesmo tunel em vez de cada um abrir o seu."""
+    if not REGISTRO.exists():
+        return {}
+    try:
+        return json.loads(REGISTRO.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def registro_gravar(dados: dict) -> None:
+    REGISTRO.write_text(json.dumps(dados, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
+
+def registro_por_cliente(id_cliente: int) -> dict | None:
+    """Entrada do registro se o tunel ainda estiver de pe. Limpa se caiu."""
+    reg = registro_ler()
+    item = reg.get(str(id_cliente))
+    if not item:
+        return None
+    if escutando(item.get("porta", 0)):
+        return item
+    reg.pop(str(id_cliente), None)
+    registro_gravar(reg)
+    return None
+
+
+def abrir(identificador: str, porta: int | None = None) -> dict:
+    cliente = cliente_ssh.resolver(identificador)
+    if not cliente:
+        raise RuntimeError(f"Cliente nao cadastrado: {identificador}")
+    if not cliente["ativo"]:
+        raise RuntimeError(f"Cliente inativo: {cliente['nome']}")
+    for campo in ("ssh_endereco", "ssh_usuario", "ssh_senha", "db_endereco"):
+        if not cliente.get(campo):
+            raise RuntimeError(
+                f"Cliente {cliente['nome']} sem {campo} no cadastro.")
+
+    # Reusa o tunel ja aberto: cada abertura custa um handshake SSH, e nada
+    # ganha em ter dois encaminhamentos para o mesmo destino.
+    existente = registro_por_cliente(cliente["id"])
+    if existente and not porta:
+        return dict(existente, reusado=True)
+
+    conferir_hostkey(cliente)
+
+    porta = porta or porta_livre()
+    pid = (abrir_windows if USAR_WINDOWS else abrir_linux)(cliente, porta)
+    item = {
+        "cliente": cliente["nome"],
+        "id": cliente["id"],
+        "porta": porta,
+        "pid": pid,
+        "destino": f"{cliente['db_endereco']}:{cliente['db_porta'] or 5432}",
+        "base": cliente["db_nome"],
+        "usuario": cliente["db_usuario"],
+    }
+    reg = registro_ler()
+    reg[str(cliente["id"])] = item
+    registro_gravar(reg)
+    return item
+
+
+def fechar_cliente(identificador: str) -> bool:
+    """Fecha o tunel de um cliente pelo registro, sem precisar saber o pid."""
+    c = cliente_ssh.resolver(identificador, revelar=False)
+    if not c:
+        return False
+    reg = registro_ler()
+    item = reg.pop(str(c["id"]), None)
+    registro_gravar(reg)
+    return fechar(item["pid"]) if item else False
+
+
+def abertos() -> list[dict]:
+    """Tuneis vivos. Entradas mortas saem do registro na conferencia."""
+    reg = registro_ler()
+    vivos = {k: v for k, v in reg.items() if escutando(v.get("porta", 0))}
+    if len(vivos) != len(reg):
+        registro_gravar(vivos)
+    return list(vivos.values())
+
+
+def fechar(pid: int) -> bool:
+    if USAR_WINDOWS:
+        # errors="replace": a saida do taskkill vem em cp850 e derrubava a
+        # decodificacao, escondendo o resultado real da operacao.
+        r = subprocess.run(["cmd.exe", "/c", f"taskkill /PID {pid} /T /F"],
+                           capture_output=True, text=True, errors="replace",
+                           cwd="/mnt/c" if IS_LINUX else None)
+        return r.returncode == 0
+    try:
+        os.kill(pid, 15)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--abrir", metavar="CLIENTE", help="id ou nome do cliente")
+    g.add_argument("--fechar", metavar="PID", type=int)
+    g.add_argument("--fechar-cliente", metavar="CLIENTE",
+                   help="fecha pelo cadastro, sem precisar do pid")
+    g.add_argument("--listar", action="store_true", help="clientes cadastrados")
+    g.add_argument("--abertos", action="store_true", help="tuneis no ar")
+    g.add_argument("--porta", metavar="CLIENTE", dest="porta_de",
+                   help="porta local do cliente, abrindo o tunel se preciso")
+    p.add_argument("--porta-fixa", type=int, dest="porta",
+                   help="porta local fixa (padrao: efemera, escolhida pelo sistema)")
+    a = p.parse_args()
+
+    try:
+        if a.listar:
+            for c in cliente_ssh.listar(revelar=False):
+                marca = "" if c["ativo"] else "  (inativo)"
+                print(f"{c['id']:>3}  {c['nome']:<24} "
+                      f"{c['ssh_usuario'] or '-'}@{c['ssh_endereco'] or '-'} "
+                      f"-> {c['db_endereco']}:{c['db_porta'] or 5432}{marca}")
+            return 0
+
+        if a.abertos:
+            for t in abertos():
+                print(f"{t['id']:>3}  {t['cliente']:<24} "
+                      f"127.0.0.1:{t['porta']} -> {t['destino']}  (pid {t['pid']})")
+            return 0
+
+        if a.porta_de:
+            print(abrir(a.porta_de)["porta"])
+            return 0
+
+        if a.fechar_cliente:
+            return 0 if fechar_cliente(a.fechar_cliente) else 1
+
+        if a.fechar:
+            return 0 if fechar(a.fechar) else 1
+
+        print(json.dumps(abrir(a.abrir, a.porta), ensure_ascii=False))
+        return 0
+    except (RuntimeError, ValueError, cliente_ssh.SemChave) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

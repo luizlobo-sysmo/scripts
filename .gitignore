@@ -1,0 +1,10 @@
+# Estado e segredo nunca entram no repositorio.
+__pycache__/
+*.pyc
+
+# A base de clientes e a chave ficam em ../db, fora daqui. Se alguem apontar
+# CLAUDE_DB_DIR para esta pasta, estes padroes evitam o acidente.
+*.db
+.env
+known_hosts
+tuneis.json
