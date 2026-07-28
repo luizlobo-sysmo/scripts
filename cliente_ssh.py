@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 PREFIXO = "enc:v1:"
@@ -26,7 +27,10 @@ VARIAVEL_CHAVE = "CRIPTO_CHAVE"
 # Raiz configuravel para o modulo servir a projetos em outros caminhos.
 PASTA_BASE = Path(os.environ.get(
     "CLAUDE_DB_DIR", str(Path(__file__).resolve().parent.parent / "db")))
-ARQUIVO_BASE = PASTA_BASE / "cliente_ssh.db"
+ARQUIVO_BASE = PASTA_BASE / "cliente.db"
+# Nome anterior. Maquina que ainda tem o arquivo velho e nao o novo e migrada na
+# primeira leitura, para nao ficarem duas bases e ninguem saber qual vale.
+ARQUIVO_BASE_ANTIGO = PASTA_BASE / "cliente_ssh.db"
 ARQUIVO_ENV = PASTA_BASE / ".env"
 KNOWN_HOSTS = PASTA_BASE / "known_hosts"
 
@@ -113,12 +117,32 @@ def decifrar(guardado: str | None) -> str | None:
 
 def conexao() -> sqlite3.Connection:
     PASTA_BASE.mkdir(parents=True, exist_ok=True)
+    _migrar_nome()
     # timeout: o backend Java escreve na mesma base. Sem espera, uma escrita
     # concorrente devolveria "database is locked" de imediato.
     con = sqlite3.connect(ARQUIVO_BASE, timeout=5.0)
     con.row_factory = sqlite3.Row
     con.execute(DDL)
     return con
+
+
+def _migrar_nome() -> None:
+    """Renomeia a base do nome antigo (cliente_ssh.db) para o atual (cliente.db).
+
+    Uma vez, e so quando o novo ainda nao existe. Renomear em vez de aceitar os dois
+    nomes de proposito: com dois arquivos validos, cada ferramenta poderia abrir um e
+    ninguem saberia qual cadastro vale.
+    """
+    if ARQUIVO_BASE.exists() or not ARQUIVO_BASE_ANTIGO.exists():
+        return
+    try:
+        ARQUIVO_BASE_ANTIGO.rename(ARQUIVO_BASE)
+        print(f"[aviso] base renomeada de {ARQUIVO_BASE_ANTIGO.name} para "
+              f"{ARQUIVO_BASE.name}.", file=sys.stderr)
+    except OSError as e:
+        raise RuntimeError(
+            f"Nao consegui renomear {ARQUIVO_BASE_ANTIGO} para {ARQUIVO_BASE}: {e}. "
+            "Feche quem estiver usando a base e tente de novo.") from e
 
 
 def _dto(linha: sqlite3.Row, revelar: bool) -> dict:

@@ -10,6 +10,14 @@ e imprime em stdout uma linha JSON com a porta local. Quem chamou conecta em
     python tunel.py --fechar 12345
     python tunel.py --listar
 
+    echo '{"ssh_endereco":"...","ssh_usuario":"...","ssh_senha":"...","db_endereco":"..."}' \\
+      | python tunel.py --testar
+    {"cliente": "(teste)", "porta": 53198, "pid": 12346, "destino": "...", "teste": true}
+
+--testar serve para validar um acesso que ainda nao esta no cadastro (ou uma senha
+nova): recebe os dados por stdin, nao le nem grava a base, e nao entra no registro
+de tuneis. Quem chamou fecha pelo pid.
+
 Porta local efemera por padrao (o sistema escolhe uma livre). Porta fixa dava
 colisao entre clientes e com outros processos, e obrigava um cliente por vez.
 
@@ -166,18 +174,35 @@ def extrair_fingerprint(pino: str | None) -> str:
     return m.group(1) if m else pino.strip()
 
 
-def conferir_hostkey(cliente: dict) -> None:
-    """Recusa se a host key divergir do pino gravado no cadastro."""
+def conferir_hostkey(cliente: dict) -> str:
+    """Recusa se a host key divergir do pino gravado no cadastro.
+
+    Sem pino, DESCOBRE a chave apresentada e a fixa no dicionario para esta conexao,
+    devolvendo qual foi. Nao e frouxidao acrescentada: o plink roda com -batch e
+    recusa chave desconhecida, entao sem isso cliente sem pino no cadastro nao
+    conectava de jeito nenhum - e a tela promete justamente o contrario ("em branco,
+    a conexao e feita sem conferir a identidade do servidor").
+
+    Quem chama avisa a quem opera qual chave foi aceita, para poder ser conferida por
+    canal independente e gravada. Gravar sozinho seria confiar sem conferencia.
+    """
     pino = (cliente.get("ssh_hostkey") or "").strip()
     if not pino:
-        atual = fingerprint_remota(cliente, "ed25519") or \
-            fingerprint_remota(cliente, "rsa")
-        if atual:
-            print(f"[aviso] host key nao fixada para {cliente['nome']}. "
-                  f"Apresentada agora: {atual}\n"
-                  f"        Confira por canal independente e grave em ssh_hostkey "
-                  f"para que trocas futuras sejam recusadas.", file=sys.stderr)
-        return
+        atual = (fingerprint_remota(cliente, "ed25519")
+                 or fingerprint_remota(cliente, "rsa")
+                 or fingerprint_remota(cliente, "ecdsa"))
+        if not atual:
+            raise RuntimeError(
+                f"Nao obtive a host key de {cliente['ssh_endereco']}:"
+                f"{cliente['ssh_porta'] or 22} (ssh-keyscan sem resposta). "
+                "Confira endereco e porta de SSH.")
+        print(f"[aviso] host key nao fixada para {cliente['nome']}. "
+              f"Aceita agora: {atual}\n"
+              f"        Confira por canal independente e grave em ssh_hostkey "
+              f"para que trocas futuras sejam recusadas.", file=sys.stderr)
+        # Fixa so para esta conexao: o cadastro nao e alterado daqui.
+        cliente["ssh_hostkey"] = atual
+        return atual
 
     m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", pino)
     esperado = m.group(1) if m else pino
@@ -199,6 +224,7 @@ def conferir_hostkey(cliente: dict) -> None:
             f"  servidor: {atual}\n"
             "Conexao abortada. Pode ser troca legitima de servidor ou "
             "interceptacao - confirme por canal independente antes de atualizar.")
+    return ""
 
 
 def abrir_windows(cliente: dict, porta: int) -> int:
@@ -235,24 +261,59 @@ def abrir_windows(cliente: dict, porta: int) -> int:
         cmd = ["cmd.exe", "/c", str(bat_wsl)]
         cwd = None
 
-    proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A saida do plink vai para arquivo, nao para DEVNULL: quando ele recusa a
+    # conexao, o motivo esta ai ("Access denied", "Host does not exist", host key
+    # divergente). Antes o erro era sempre "plink encerrou sem abrir o tunel" e
+    # nao dava para distinguir senha errada de servidor inalcancavel.
+    #
+    # Arquivo e nao PIPE: o processo fica em background e ninguem le o cano depois
+    # que esta funcao retorna - o buffer encheria e travaria o tunel.
+    log = temp_wsl / f"{nome}.log"
+    saida = log.open("wb")
     try:
+        proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True,
+                                stdin=subprocess.DEVNULL,
+                                stdout=saida, stderr=subprocess.STDOUT)
         for _ in range(40):
             if escutando(porta):
                 # Pid do plink no Windows, nao do cmd.exe: e ele que sustenta o
                 # tunel e e ele que o --fechar precisa encerrar.
                 return pid_do_listener(porta) or proc.pid
             if proc.poll() is not None:
-                raise RuntimeError(
-                    "plink encerrou sem abrir o tunel. Confira usuario, senha e "
-                    "host key do cadastro.")
+                raise RuntimeError("plink encerrou sem abrir o tunel. "
+                                   + (detalhe_plink(log) or "Confira usuario, senha e "
+                                      "host key do cadastro."))
             time.sleep(0.5)
-        raise RuntimeError(f"tunel nao subiu em 20s na porta {porta}.")
+        raise RuntimeError(f"tunel nao subiu em 20s na porta {porta}. "
+                           + detalhe_plink(log))
     finally:
+        saida.close()
         # O .bat contem a senha: apagar sempre, inclusive no caminho de erro. O
         # plink ja esta rodando e nao precisa mais dele.
-        bat_wsl.unlink(missing_ok=True)
+        apagar(bat_wsl)
+        # O log fica aberto pelo plink enquanto o tunel vive, e o Windows recusa
+        # apagar arquivo em uso - por isso apagar sem falhar. No caminho de erro o
+        # plink ja morreu e a remocao funciona; no de sucesso o arquivo (sem segredo,
+        # so a saida do plink) sai quando o tunel for fechado.
+        apagar(log)
+
+
+def apagar(caminho: Path) -> None:
+    """Remove sem derrubar quem chamou. Arquivo em uso no Windows levanta OSError."""
+    try:
+        caminho.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def detalhe_plink(log: Path) -> str:
+    """O que o plink escreveu, para a mensagem de erro dizer a causa."""
+    try:
+        texto = log.read_text(encoding="cp1252", errors="replace").strip()
+    except OSError:
+        return ""
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    return " / ".join(linhas[-3:])
 
 
 def abrir_linux(cliente: dict, porta: int) -> int:
@@ -363,6 +424,51 @@ def abrir(identificador: str, porta: int | None = None) -> dict:
     return item
 
 
+def testar(dados: dict) -> dict:
+    """Abre um tunel com dados informados na chamada, sem passar pelo cadastro.
+
+    Existe para a tela de Clientes conseguir validar um acesso ANTES de gravar - ou
+    uma senha nova que ainda nao esta na base. Recebe o mesmo dicionario que o
+    cadastro produz, mas por stdin, para a senha nao aparecer em `ps` nem no
+    historico do shell.
+
+    Nao entra no registro de tuneis abertos: um teste nao deve ser reaproveitado
+    como tunel de trabalho, e o chamador fecha pelo pid devolvido.
+    """
+    faltando = [c for c in ("ssh_endereco", "ssh_usuario", "ssh_senha", "db_endereco")
+                if not dados.get(c)]
+    if faltando:
+        raise RuntimeError("Informe " + ", ".join(faltando) + ".")
+
+    cliente = {
+        "id": 0,
+        "nome": dados.get("nome") or "(teste)",
+        "ativo": 1,
+        "ssh_endereco": dados["ssh_endereco"],
+        "ssh_porta": dados.get("ssh_porta") or 22,
+        "ssh_usuario": dados["ssh_usuario"],
+        "ssh_senha": dados["ssh_senha"],
+        "ssh_hostkey": dados.get("ssh_hostkey") or "",
+        "db_endereco": dados["db_endereco"],
+        "db_porta": dados.get("db_porta") or 5432,
+        "db_nome": dados.get("db_nome") or "",
+        "db_usuario": dados.get("db_usuario") or "",
+    }
+
+    apresentada = conferir_hostkey(cliente)
+
+    porta = porta_livre()
+    pid = (abrir_windows if USAR_WINDOWS else abrir_linux)(cliente, porta)
+    return {
+        "cliente": cliente["nome"],
+        "porta": porta,
+        "pid": pid,
+        "destino": f"{cliente['db_endereco']}:{cliente['db_porta']}",
+        "hostkey": apresentada,
+        "teste": True,
+    }
+
+
 def fechar_cliente(identificador: str) -> bool:
     """Fecha o tunel de um cliente pelo registro, sem precisar saber o pid."""
     c = cliente_ssh.resolver(identificador, revelar=False)
@@ -410,6 +516,9 @@ def main() -> int:
     g.add_argument("--abertos", action="store_true", help="tuneis no ar")
     g.add_argument("--porta", metavar="CLIENTE", dest="porta_de",
                    help="porta local do cliente, abrindo o tunel se preciso")
+    g.add_argument("--testar", action="store_true",
+                   help="abre um tunel com os dados de acesso lidos de stdin (JSON), "
+                        "sem consultar nem gravar no cadastro; devolve porta e pid")
     p.add_argument("--porta-fixa", type=int, dest="porta",
                    help="porta local fixa (padrao: efemera, escolhida pelo sistema)")
     a = p.parse_args()
@@ -431,6 +540,11 @@ def main() -> int:
 
         if a.porta_de:
             print(abrir(a.porta_de)["porta"])
+            return 0
+
+        if a.testar:
+            print(json.dumps(testar(json.loads(sys.stdin.read())),
+                             ensure_ascii=False))
             return 0
 
         if a.fechar_cliente:
