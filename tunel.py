@@ -227,9 +227,45 @@ def conferir_hostkey(cliente: dict) -> str:
     return ""
 
 
+def escapar_bat(valor: object) -> str:
+    """Escapa um valor interpolado no .bat.
+
+    O cmd.exe expande `%...%` ANTES de o plink ver os argumentos, e faz isso tambem
+    dentro de aspas. Um `%` no meio de um valor nao some sozinho: o cmd procura o `%`
+    de fechamento no resto da linha e engole tudo que esta entre os dois - inclusive
+    parametros seguintes.
+
+    Foi essa a causa de um cliente com `%` na senha falhar sempre com "Cannot confirm a
+    host key in batch mode": o `-hostkey` seguinte desaparecia da linha, e o plink caia
+    no caminho de chave desconhecida. `%%` chega ao programa como um `%`.
+    """
+    return str(valor).replace("%", "%%")
+
+
+def limpar_restos(temp_wsl: Path) -> None:
+    """Apaga sobras de execucoes anteriores no Temp.
+
+    O `.pw` sai no finally, mas processo morto a forca (kill, queda de energia) entre a
+    escrita e o finally deixa uma senha em texto puro no disco. Uma hora e folga
+    generosa: uma abertura de tunel dura segundos, entao nada em uso e alcancado.
+
+    Os `.log` tambem entram: o plink os mantem abertos enquanto o tunel vive, e por isso
+    quase nunca somem na hora - iam acumulando indefinidamente.
+    """
+    limite = time.time() - 3600
+    for p in list(temp_wsl.glob("tunel-*.pw")) + list(temp_wsl.glob("tunel-*.bat")) \
+            + list(temp_wsl.glob("tunel-*.bat.log")):
+        try:
+            if p.stat().st_mtime < limite:
+                apagar(p)
+        except OSError:
+            pass
+
+
 def abrir_windows(cliente: dict, porta: int) -> int:
-    """plink.exe em background. A senha fica num .bat temporario, nunca em `ps`."""
+    """plink.exe em background. A senha vai por arquivo, nunca em `ps` nem no .bat."""
     temp_wsl, temp_win = win_temp()
+    limpar_restos(temp_wsl)
     nome = f"tunel-{cliente['id']}-{porta}.bat"
     bat_wsl = temp_wsl / nome
     destino = f"{cliente['db_endereco']}:{cliente['db_porta'] or 5432}"
@@ -240,17 +276,24 @@ def abrir_windows(cliente: dict, porta: int) -> int:
     pino = extrair_fingerprint(cliente.get("ssh_hostkey"))
     parametro_hostkey = f'-hostkey "{pino}" ' if pino else ""
 
-    # Senha entre aspas: senhas reais tem $ * ( & e o cmd.exe quebraria a linha
-    # sem elas. O .bat e apagado em seguida.
+    # Senha por arquivo (-pwfile), nao por -pw: assim ela nao passa pelo parser do
+    # cmd.exe, que mexe em `%` e trata `&` `^` `!` como sintaxe. Senha real tem esses
+    # caracteres, e com -pw a linha chegava alterada - ou quebrada - ao plink.
+    # Apagado no finally, como o .bat.
+    pw_nome = f"tunel-{cliente['id']}-{porta}.pw"
+    pw_wsl = temp_wsl / pw_nome
+    pw_win = rf"{temp_win}\{pw_nome}" if IS_LINUX else str(pw_wsl)
+    pw_wsl.write_text(cliente["ssh_senha"], encoding="cp1252", newline="")
+
     bat_wsl.write_text(
         "@echo off\r\n"
         f'"{achar_plink()}" -ssh -N -batch '
-        f'-P {cliente["ssh_porta"] or 22} '
-        f'-l {cliente["ssh_usuario"]} '
-        f'-pw "{cliente["ssh_senha"]}" '
+        f'-P {int(cliente["ssh_porta"] or 22)} '
+        f'-l {escapar_bat(cliente["ssh_usuario"])} '
+        f'-pwfile "{escapar_bat(pw_win)}" '
         f'{parametro_hostkey}'
-        f'-L 127.0.0.1:{porta}:{destino} '
-        f'{cliente["ssh_endereco"]}\r\n',
+        f'-L 127.0.0.1:{porta}:{escapar_bat(destino)} '
+        f'{escapar_bat(cliente["ssh_endereco"])}\r\n',
         encoding="cp1252", newline="",
     )
 
@@ -288,8 +331,10 @@ def abrir_windows(cliente: dict, porta: int) -> int:
                            + detalhe_plink(log))
     finally:
         saida.close()
-        # O .bat contem a senha: apagar sempre, inclusive no caminho de erro. O
-        # plink ja esta rodando e nao precisa mais dele.
+        # O arquivo de senha some sempre, inclusive no caminho de erro: o plink le a
+        # senha na autenticacao, que ja aconteceu quando a porta abriu ou quando o
+        # processo morreu. O .bat vai junto por simetria.
+        apagar(pw_wsl)
         apagar(bat_wsl)
         # O log fica aberto pelo plink enquanto o tunel vive, e o Windows recusa
         # apagar arquivo em uso - por isso apagar sem falhar. No caminho de erro o
