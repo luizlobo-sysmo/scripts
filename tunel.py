@@ -151,18 +151,56 @@ def win_temp() -> tuple[Path, str]:
     return Path(temp), temp
 
 
+def candidatos_keyscan() -> list[str]:
+    """ssh-keyscan disponiveis, na ordem em que valem a tentativa.
+
+    O do System32 vem DEPOIS do Git for Windows de proposito: o
+    OpenSSH_for_Windows_9.5p2 anuncia o KEX sntrup761x25519-sha512@openssh.com sem
+    implementar, e contra servidor que o oferece (OpenSSH 9.6 do Ubuntu, por
+    exemplo) ele aborta com "choose_kex: unsupported KEX method" - devolve so o
+    banner, nenhuma chave. O 9.1 do Git nem anuncia, negocia outro e funciona.
+
+    Ordem, nao escolha unica: qualquer um pode nao estar instalado, e qual falha
+    depende do servidor do outro lado.
+    """
+    if IS_LINUX:
+        return ["ssh-keyscan"]
+    fixos = [r"C:\Program Files\Git\usr\bin\ssh-keyscan.exe",
+             r"C:\Windows\System32\OpenSSH\ssh-keyscan.exe"]
+    return [c for c in fixos if Path(c).exists()] + ["ssh-keyscan"]
+
+
+# Motivo da ultima falha de keyscan, para a mensagem de erro nao ficar so em "sem
+# resposta" - foi justamente isso que fez procurar endereco e porta errados quando
+# o problema era incompatibilidade de KEX.
+_ULTIMA_FALHA_KEYSCAN = ""
+
+
 def fingerprint_remota(cliente: dict, tipo: str) -> str:
-    """Fingerprint SHA256 da host key, via ssh-keyscan."""
-    cmd = ["ssh-keyscan", "-t", tipo, "-p", str(cliente["ssh_porta"] or 22),
-           cliente["ssh_endereco"]]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    linhas = [l for l in r.stdout.splitlines() if l and not l.startswith("#")]
-    if not linhas:
-        return ""
-    proc = subprocess.run(["ssh-keygen", "-lf", "-"], input="\n".join(linhas),
-                          capture_output=True, text=True, errors="replace")
-    m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", proc.stdout)
-    return m.group(1) if m else ""
+    """Fingerprint SHA256 da host key, via ssh-keyscan. Vazio quando nenhum serve."""
+    global _ULTIMA_FALHA_KEYSCAN
+    falhas: list[str] = []
+    for binario in candidatos_keyscan():
+        cmd = [binario, "-t", tipo, "-p", str(cliente["ssh_porta"] or 22),
+               cliente["ssh_endereco"]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        except OSError as e:
+            falhas.append(f"{binario}: {e}")
+            continue
+        linhas = [l for l in r.stdout.splitlines() if l and not l.startswith("#")]
+        if not linhas:
+            detalhe = " | ".join(l.strip() for l in r.stderr.splitlines() if l.strip())
+            falhas.append(f"{Path(binario).name}: {detalhe or 'nenhuma chave na saida'}")
+            continue
+        proc = subprocess.run(["ssh-keygen", "-lf", "-"], input="\n".join(linhas),
+                              capture_output=True, text=True, errors="replace")
+        m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", proc.stdout)
+        if m:
+            return m.group(1)
+        falhas.append(f"{Path(binario).name}: ssh-keygen nao extraiu fingerprint")
+    _ULTIMA_FALHA_KEYSCAN = "; ".join(falhas)
+    return ""
 
 
 def extrair_fingerprint(pino: str | None) -> str:
@@ -194,8 +232,8 @@ def conferir_hostkey(cliente: dict) -> str:
         if not atual:
             raise RuntimeError(
                 f"Nao obtive a host key de {cliente['ssh_endereco']}:"
-                f"{cliente['ssh_porta'] or 22} (ssh-keyscan sem resposta). "
-                "Confira endereco e porta de SSH.")
+                f"{cliente['ssh_porta'] or 22}. Confira endereco e porta de SSH. "
+                f"Tentativas: {_ULTIMA_FALHA_KEYSCAN}")
         print(f"[aviso] host key nao fixada para {cliente['nome']}. "
               f"Aceita agora: {atual}\n"
               f"        Confira por canal independente e grave em ssh_hostkey "
@@ -215,8 +253,8 @@ def conferir_hostkey(cliente: dict) -> str:
     atual = fingerprint_remota(cliente, tipo)
     if not atual:
         raise RuntimeError(
-            f"Nao obtive a host key {tipo} de {cliente['ssh_endereco']} "
-            "(ssh-keyscan sem resposta).")
+            f"Nao obtive a host key {tipo} de {cliente['ssh_endereco']}. "
+            f"Tentativas: {_ULTIMA_FALHA_KEYSCAN}")
     if atual != esperado:
         raise RuntimeError(
             f"ALERTA: host key DIFERENTE da fixada no cadastro.\n"
