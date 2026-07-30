@@ -507,6 +507,127 @@ def abrir(identificador: str, porta: int | None = None) -> dict:
     return item
 
 
+def testar_login(dados: dict) -> dict:
+    """Autentica no SSH e sai, SEM abrir encaminhamento.
+
+    Serve para validar usuario, senha e host key antes de se saber o IP interno do
+    banco - que e informacao que o cliente costuma mandar depois. O teste de tunel
+    exige destino porque `-L` nao existe sem ele; este nao.
+
+    Roda um comando trivial no servidor (`hostname`) em vez de so conectar: assim o
+    resultado tambem diz EM QUAL maquina a credencial entrou, o que pega cadastro
+    apontando para o servidor errado com usuario que existe nos dois.
+    """
+    faltando = [c for c in ("ssh_endereco", "ssh_usuario", "ssh_senha") if not dados.get(c)]
+    if faltando:
+        raise RuntimeError("Informe " + ", ".join(faltando) + ".")
+
+    cliente = {
+        "id": 0,
+        "nome": dados.get("nome") or "(teste)",
+        "ssh_endereco": dados["ssh_endereco"],
+        "ssh_porta": dados.get("ssh_porta") or 22,
+        "ssh_usuario": dados["ssh_usuario"],
+        "ssh_senha": dados["ssh_senha"],
+        "ssh_hostkey": dados.get("ssh_hostkey") or "",
+    }
+    # Mesma conferencia do tunel: com pino, divergencia aborta; sem pino, descobre a
+    # chave apresentada e devolve qual foi, para poder ser fixada depois.
+    aceita = conferir_hostkey(cliente)
+
+    if USAR_WINDOWS:
+        maquina = _login_windows(cliente)
+    else:
+        maquina = _login_linux(cliente)
+
+    return {
+        "ok": True,
+        "cliente": cliente["nome"],
+        "servidor": maquina,
+        "hostkey": aceita,
+        "hostkey_fixada": bool((dados.get("ssh_hostkey") or "").strip()),
+    }
+
+
+def _login_windows(cliente: dict) -> str:
+    """plink com comando remoto, em primeiro plano. Devolve o hostname remoto."""
+    temp_wsl, temp_win = win_temp()
+    limpar_restos(temp_wsl)
+    nome = f"login-{os.getpid()}.bat"
+    bat_wsl = temp_wsl / nome
+    pw_nome = f"login-{os.getpid()}.pw"
+    pw_wsl = temp_wsl / pw_nome
+    pw_win = rf"{temp_win}\{pw_nome}" if IS_LINUX else str(pw_wsl)
+    pw_wsl.write_text(cliente["ssh_senha"], encoding="cp1252", newline="")
+
+    pino = extrair_fingerprint(cliente.get("ssh_hostkey"))
+    parametro_hostkey = f'-hostkey "{pino}" ' if pino else ""
+
+    # Sem -N: aqui a graca e justamente executar algo. `hostname` existe em qualquer
+    # Linux e nao depende de shell interativo.
+    bat_wsl.write_text(
+        "@echo off\r\n"
+        f'"{achar_plink()}" -ssh -batch '
+        f'-P {int(cliente["ssh_porta"] or 22)} '
+        f'-l {escapar_bat(cliente["ssh_usuario"])} '
+        f'-pwfile "{escapar_bat(pw_win)}" '
+        f'{parametro_hostkey}'
+        f'{escapar_bat(cliente["ssh_endereco"])} hostname\r\n',
+        encoding="cp1252", newline="",
+    )
+
+    if IS_LINUX:
+        cmd = ["cmd.exe", "/c", rf"{temp_win}\{nome}"]
+        cwd = "/mnt/c"
+    else:
+        cmd = ["cmd.exe", "/c", str(bat_wsl)]
+        cwd = None
+
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                           errors="replace", timeout=45)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("O SSH nao respondeu em 45s. Confira endereco e porta.")
+    finally:
+        apagar(pw_wsl)
+        apagar(bat_wsl)
+
+    if r.returncode != 0:
+        # A saida do plink diz a causa: "Access denied", "Host does not exist", host
+        # key divergente. Sem ela sobraria "falhou", que nao ajuda ninguem.
+        detalhe = " / ".join(l.strip() for l in (r.stdout + r.stderr).splitlines() if l.strip())
+        raise RuntimeError(detalhe or "O plink recusou a conexao, sem dizer o motivo.")
+    return (r.stdout or "").strip().splitlines()[-1].strip() if r.stdout.strip() else "(sem nome)"
+
+
+def _login_linux(cliente: dict) -> str:
+    """ssh com comando remoto. Senha via SSH_ASKPASS, como no tunel."""
+    askpass = Path("/dev/shm/tunel-askpass-login.sh")
+    askpass.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' {shlex.quote(cliente['ssh_senha'])}\n", encoding="utf-8")
+    askpass.chmod(0o700)
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=15", "-p", str(int(cliente["ssh_porta"] or 22)),
+             f"{cliente['ssh_usuario']}@{cliente['ssh_endereco']}", "hostname"],
+            env={**os.environ, "SSH_ASKPASS": str(askpass),
+                 "SSH_ASKPASS_REQUIRE": "force",
+                 "DISPLAY": os.environ.get("DISPLAY", ":0")},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", timeout=45)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("O SSH nao respondeu em 45s. Confira endereco e porta.")
+    finally:
+        apagar(askpass)
+
+    if r.returncode != 0:
+        detalhe = " / ".join(l.strip() for l in r.stderr.splitlines() if l.strip())
+        raise RuntimeError(detalhe or "O ssh recusou a conexao, sem dizer o motivo.")
+    return (r.stdout or "").strip() or "(sem nome)"
+
+
 def testar(dados: dict) -> dict:
     """Abre um tunel com dados informados na chamada, sem passar pelo cadastro.
 
@@ -602,6 +723,9 @@ def main() -> int:
     g.add_argument("--testar", action="store_true",
                    help="abre um tunel com os dados de acesso lidos de stdin (JSON), "
                         "sem consultar nem gravar no cadastro; devolve porta e pid")
+    g.add_argument("--testar-login", action="store_true", dest="testar_login",
+                   help="so autentica no SSH (sem encaminhamento) com os dados lidos de "
+                        "stdin (JSON); devolve o hostname do servidor e a host key aceita")
     p.add_argument("--porta-fixa", type=int, dest="porta",
                    help="porta local fixa (padrao: efemera, escolhida pelo sistema)")
     a = p.parse_args()
@@ -623,6 +747,10 @@ def main() -> int:
 
         if a.porta_de:
             print(abrir(a.porta_de)["porta"])
+            return 0
+
+        if a.testar_login:
+            print(json.dumps(testar_login(json.loads(sys.stdin.read() or "{}"))))
             return 0
 
         if a.testar:
