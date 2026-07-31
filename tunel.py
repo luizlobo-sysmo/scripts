@@ -225,6 +225,24 @@ def conferir_hostkey(cliente: dict) -> str:
     canal independente e gravada. Gravar sozinho seria confiar sem conferencia.
     """
     pino = (cliente.get("ssh_hostkey") or "").strip()
+
+    # COM pino, quem confere e o plink: ele recebe -hostkey e recusa na handshake se a
+    # chave nao for a fixada. O keyscan aqui era uma segunda conexao para checar o que a
+    # primeira ja checa, e trazia dois problemas proprios:
+    #
+    #   servidor com fail2ban ou rate limit derruba a segunda conexao, e a falha do
+    #   keyscan virava falha de acesso - o Righi parou de conectar por isso, com o pino
+    #   correto no cadastro;
+    #
+    #   quando o keyscan do tipo pinado nao responde, o fallback pega OUTRO tipo (rsa em
+    #   vez de ed25519) e compara chaves de tipos diferentes: divergencia garantida,
+    #   anunciada como troca de servidor.
+    #
+    # Sem pino o keyscan continua sendo o unico jeito de saber qual chave o servidor
+    # apresenta, e ai ele fica.
+    if pino:
+        return extrair_fingerprint(pino)
+
     if not pino:
         atual = (fingerprint_remota(cliente, "ed25519")
                  or fingerprint_remota(cliente, "rsa")
@@ -241,28 +259,6 @@ def conferir_hostkey(cliente: dict) -> str:
         # Fixa so para esta conexao: o cadastro nao e alterado daqui.
         cliente["ssh_hostkey"] = atual
         return atual
-
-    m = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", pino)
-    esperado = m.group(1) if m else pino
-    tipo = "ed25519"
-    if "rsa" in pino.lower():
-        tipo = "rsa"
-    elif "ecdsa" in pino.lower():
-        tipo = "ecdsa"
-
-    atual = fingerprint_remota(cliente, tipo)
-    if not atual:
-        raise RuntimeError(
-            f"Nao obtive a host key {tipo} de {cliente['ssh_endereco']}. "
-            f"Tentativas: {_ULTIMA_FALHA_KEYSCAN}")
-    if atual != esperado:
-        raise RuntimeError(
-            f"ALERTA: host key DIFERENTE da fixada no cadastro.\n"
-            f"  fixada  : {esperado}\n"
-            f"  servidor: {atual}\n"
-            "Conexao abortada. Pode ser troca legitima de servidor ou "
-            "interceptacao - confirme por canal independente antes de atualizar.")
-    return ""
 
 
 def escapar_bat(valor: object) -> str:
